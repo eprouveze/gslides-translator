@@ -1,0 +1,47 @@
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Dependency directories
+node_modules/
+bower_components/
+__pycache__/
+
+# Python specific
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Environment and secrets
+.env
+credentials.json
+token.json
+
+# IDE and editor folders
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Temporary files
+*.tmp
+*.swp
+
+# Others (adjust as needed)
+coverage/
+
+# Recovery files
+translation_recovery/
+
+# Generated output files
+*_translated.pptx
+*_ja.pptx
+*_fr.pptx
+*_de.pptx
+*_es.pptx
+*_zh.pptx
