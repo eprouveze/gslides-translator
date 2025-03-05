@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import json
 import anthropic
@@ -14,459 +15,408 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def extract_text(pptx_file):  
-    """Extract text from PowerPoint presentation with enhanced support for various text content types"""
+    """Extract text from PowerPoint presentation with comprehensive text extraction"""
     prs = Presentation(pptx_file)  
     text_dict = {}
     slide_metadata = []  # Store structured context  
+    extraction_stats = {
+        "total_slides": len(prs.slides),
+        "shapes_processed": 0,
+        "text_elements_found": 0,
+        "paragraphs_found": 0
+    }
     
-    # Extract text from a shape recursively, to handle grouped shapes
-    def extract_shape_text(shape, shape_type="shape", parent_id=""):
-        extracted_texts = {}
+    # Special function to extract all possible text from a shape
+    def process_text_frame(text_frame, element_id, slide_info):
+        nonlocal text_dict
+        extraction_stats["paragraphs_found"] += len(text_frame.paragraphs)
         
-        # Get alt text if available (often contains important content)
-        try:
-            if hasattr(shape, "shape_properties") and hasattr(shape.shape_properties, "title") and shape.shape_properties.title:
-                alt_text_id = f"{parent_id}_alt_text"
-                extracted_texts[alt_text_id] = shape.shape_properties.title.strip()
-        except:
-            pass
-        
-        # Extract text from basic shape
-        if hasattr(shape, "text") and shape.text.strip():
-            shape_text = shape.text.strip()
-            extracted_texts[parent_id] = shape_text
-        
-        # Handle SmartArt and other grouped shapes
-        try:
-            if hasattr(shape, "element") and hasattr(shape, "shapes"):
-                # Extract text from any child shapes in a group or SmartArt
-                try:
-                    for i, child in enumerate(shape.shapes):
-                        child_id = f"{parent_id}_child_{i}"
-                        child_texts = extract_shape_text(child, "group_child", child_id)
-                        extracted_texts.update(child_texts)
-                except (AttributeError, TypeError, ValueError):
-                    pass
-        except:
-            pass
-        
-        # Handle OLE objects (embedded Excel, etc.)
-        try:
-            if hasattr(shape, "shape_type") and shape.shape_type == 7:  # MSO_SHAPE_TYPE.OLE_OBJECT
-                ole_id = f"{parent_id}_ole"
-                # We can't directly extract text from OLE objects, but we can use alt text
-                if hasattr(shape, "alternative_text") and shape.alternative_text:
-                    extracted_texts[ole_id] = shape.alternative_text.strip()
-        except:
-            pass
+        # Extract the full text first
+        if text_frame.text.strip():
+            text_dict[element_id] = text_frame.text.strip()
+            slide_info["content"].append(text_frame.text.strip())
+            extraction_stats["text_elements_found"] += 1
             
-        # Handle charts
-        try:
-            if hasattr(shape, "chart") and shape.chart:
-                try:
-                    chart_text = []
-                    
-                    # Extract chart title
-                    if hasattr(shape.chart, "chart_title") and shape.chart.chart_title and shape.chart.chart_title.text_frame:
-                        chart_text.append(shape.chart.chart_title.text_frame.text)
-                    
-                    # Extract category names
-                    if hasattr(shape.chart, "plots"):
-                        for plot in shape.chart.plots:
-                            if hasattr(plot, "categories"):
-                                for category in plot.categories:
-                                    if category and category.strip():
-                                        chart_text.append(category)
-                    
-                    if chart_text:
-                        chart_id = f"{parent_id}_chart"
-                        extracted_texts[chart_id] = " | ".join([t for t in chart_text if t])
-                except (AttributeError, TypeError):
-                    pass
-        except:
-            pass
+            # Check if this might be a title
+            if element_id.endswith("_shape_0") or element_id.endswith("_shape_1"):
+                if not slide_info["title"] and len(text_frame.text) < 100:  # Reasonable title length
+                    slide_info["title"] = text_frame.text.strip()
+    
+    # Process a shape and all its child shapes
+    def process_shape(shape, shape_id, slide_idx, slide_info):
+        nonlocal text_dict
+        extraction_stats["shapes_processed"] += 1
+        base_id = f"slide_{slide_idx+1}_shape_{shape_id}"
         
-        return extracted_texts
-      
-    for index, slide in enumerate(prs.slides):  
-        slide_info = {  
-            "slide_number": index + 1,  
-            "title": "",  
-            "content": []  
-        }
+        # Process text frame if this shape has one
+        if hasattr(shape, "text_frame"):
+            process_text_frame(shape.text_frame, base_id, slide_info)
+                
+        # Look for a title shape
+        if hasattr(shape, "is_title") and shape.is_title:
+            if shape.text.strip():
+                slide_info["title"] = shape.text.strip()
         
-        # Extract slide notes if any
-        if hasattr(slide, "notes_slide") and slide.notes_slide:
+        # Handle placeholders - they may contain important text
+        if hasattr(shape, "is_placeholder") and shape.is_placeholder:
             try:
-                for note_shape in slide.notes_slide.shapes:
-                    if hasattr(note_shape, "text") and note_shape.text.strip():
-                        note_id = f"slide_{index+1}_notes"
-                        note_text = note_shape.text.strip()
-                        text_dict[note_id] = note_text
-                        slide_info["content"].append(f"[Note: {note_text}]")
+                if hasattr(shape, "placeholder_format") and shape.placeholder_format:
+                    ph_id = f"{base_id}_placeholder"
+                    if shape.text.strip():
+                        text_dict[ph_id] = shape.text.strip()
+                        slide_info["content"].append(shape.text.strip())
+                        extraction_stats["text_elements_found"] += 1
             except:
                 pass
         
-        # Process all shapes on the slide
-        for shape_id, shape in enumerate(slide.shapes):
-            base_id = f"slide_{index+1}_shape_{shape_id}"
-            
-            # Extract text from this shape (and any grouped sub-shapes)
-            shape_texts = extract_shape_text(shape, "shape", base_id)
-            
-            # Add all extracted text to our dictionaries
-            for obj_id, text_content in shape_texts.items():
-                if text_content.strip():
-                    text_dict[obj_id] = text_content.strip()
-                    slide_info["content"].append(text_content.strip())
-                    
-                    # If this is the base shape and looks like a title
-                    if obj_id == base_id:
-                        # If this looks like a title shape, also add to slide title
-                        if hasattr(shape, "is_title") and shape.is_title:
-                            slide_info["title"] = text_content.strip()
-                        # Alternatively check if it's a placeholder and has the right type
-                        elif hasattr(shape, "is_placeholder") and shape.is_placeholder and hasattr(shape, "placeholder_format"):
-                            try:
-                                if shape.placeholder_format.type == 1:  # 1 is title placeholder
-                                    slide_info["title"] = text_content.strip()
-                            except (ValueError, AttributeError):
-                                pass  # Handle case where placeholder_format raises an error
-                        # Fallback for first shape on first slide
-                        elif index == 0 and shape_id == 0:
-                            slide_info["title"] = text_content.strip()
-            
-            # Handle tables separately
-            if hasattr(shape, "has_table") and shape.has_table:
-                for row_idx, row in enumerate(shape.table.rows):
-                    for col_idx, cell in enumerate(row.cells):
-                        if cell.text.strip():
-                            # Create a unique ID for the table cell
-                            cell_id = f"slide_{index+1}_table_{shape_id}_r{row_idx}_c{col_idx}"
-                            text_dict[cell_id] = cell.text.strip()
-                            slide_info["content"].append(cell.text.strip())
-        
-        # Try to extract header and footer text if available
+        # Try to get text from shape properties or alt text
         try:
-            # Check placeholder shapes for header/footer content
-            for shape in slide.shapes:
-                if hasattr(shape, "is_placeholder") and shape.is_placeholder and hasattr(shape, "placeholder_format"):
-                    try:
-                        ph_type = shape.placeholder_format.type
-                        # Common placeholder types for header (3), footer (4), date (2)
-                        if ph_type in [2, 3, 4]:
-                            if hasattr(shape, "text") and shape.text.strip():
-                                ph_id = f"slide_{index+1}_placeholder_{ph_type}"
-                                text_dict[ph_id] = shape.text.strip()
-                                slide_info["content"].append(shape.text.strip())
-                    except:
-                        pass
+            if hasattr(shape, "shape_properties") and hasattr(shape.shape_properties, "title") and shape.shape_properties.title:
+                alt_id = f"{base_id}_alt"
+                text_dict[alt_id] = shape.shape_properties.title.strip()
+                slide_info["content"].append(shape.shape_properties.title.strip())
+                extraction_stats["text_elements_found"] += 1
+        except:
+            pass
+        
+        # Extract text from any child shapes (this handles groups and SmartArt)
+        try:
+            if hasattr(shape, "shapes") and shape.shapes:
+                for child_idx, child in enumerate(shape.shapes):
+                    child_id = f"{base_id}_child_{child_idx}"
+                    if hasattr(child, "text_frame") and child.text_frame:
+                        process_text_frame(child.text_frame, child_id, slide_info)
         except:
             pass
             
+        # Handle tables
+        try:
+            if hasattr(shape, "has_table") and shape.has_table:
+                for row_idx, row in enumerate(shape.table.rows):
+                    for col_idx, cell in enumerate(row.cells):
+                        if hasattr(cell, "text_frame") and cell.text_frame and cell.text.strip():
+                            cell_id = f"slide_{slide_idx+1}_table_{shape_id}_r{row_idx}_c{col_idx}"
+                            process_text_frame(cell.text_frame, cell_id, slide_info)
+        except:
+            pass
+        
+        # Handle charts
+        try:
+            if hasattr(shape, "chart") and shape.chart:
+                # Get chart title
+                if hasattr(shape.chart, "chart_title") and shape.chart.chart_title and shape.chart.chart_title.text_frame:
+                    chart_title_id = f"{base_id}_chart_title"
+                    process_text_frame(shape.chart.chart_title.text_frame, chart_title_id, slide_info)
+                
+                # Try to extract category labels
+                if hasattr(shape.chart, "plots"):
+                    label_texts = []
+                    for plot_idx, plot in enumerate(shape.chart.plots):
+                        try:
+                            if hasattr(plot, "categories") and plot.categories:
+                                for cat_idx, cat in enumerate(plot.categories):
+                                    if cat and str(cat).strip():
+                                        cat_id = f"{base_id}_chart_cat_{plot_idx}_{cat_idx}"
+                                        text_dict[cat_id] = str(cat).strip()
+                                        label_texts.append(str(cat).strip())
+                                        extraction_stats["text_elements_found"] += 1
+                        except:
+                            pass
+                            
+                    if label_texts:
+                        slide_info["content"].extend(label_texts)
+        except:
+            pass
+        
+        # Try to handle WordArt and other special text objects
+        try:
+            if hasattr(shape, "text") and shape.text.strip() and not hasattr(shape, "text_frame"):
+                special_id = f"{base_id}_special"
+                text_dict[special_id] = shape.text.strip()
+                slide_info["content"].append(shape.text.strip())
+                extraction_stats["text_elements_found"] += 1
+        except:
+            pass
+    
+    # Process all slides
+    for slide_idx, slide in enumerate(prs.slides):
+        slide_info = {
+            "slide_number": slide_idx + 1,
+            "title": "",
+            "content": []
+        }
+        
+        # Extract slide notes if any
+        try:
+            if hasattr(slide, "notes_slide") and slide.notes_slide:
+                for note_shape in slide.notes_slide.shapes:
+                    if hasattr(note_shape, "text_frame") and note_shape.text_frame and note_shape.text.strip():
+                        note_id = f"slide_{slide_idx+1}_notes"
+                        process_text_frame(note_shape.text_frame, note_id, slide_info)
+        except:
+            pass
+        
+        # Process each shape on the slide
+        for shape_idx, shape in enumerate(slide.shapes):
+            process_shape(shape, shape_idx, slide_idx, slide_info)
+        
+        # Get header and footer elements
+        try:
+            for elem in ["header", "footer", "date"]:
+                placeholder_index = {"header": 2, "footer": 4, "date": 3}.get(elem)
+                if placeholder_index:
+                    for shape in slide.shapes:
+                        try:
+                            if (hasattr(shape, "is_placeholder") and 
+                                shape.is_placeholder and 
+                                hasattr(shape, "placeholder_format") and 
+                                shape.placeholder_format.idx == placeholder_index and
+                                shape.text.strip()):
+                                elem_id = f"slide_{slide_idx+1}_{elem}"
+                                text_dict[elem_id] = shape.text.strip()
+                                slide_info["content"].append(shape.text.strip())
+                                extraction_stats["text_elements_found"] += 1
+                        except:
+                            pass
+        except:
+            pass
+        
+        # Add the slide info to metadata
         slide_metadata.append(slide_info)
     
-    # Extract any text from master slides that might appear on all slides
+    # Extract any text from master slides
     try:
-        for idx, master in enumerate(prs.slide_masters):
-            for shape_id, shape in enumerate(master.shapes):
-                if hasattr(shape, "text") and shape.text.strip():
-                    master_id = f"master_{idx+1}_shape_{shape_id}"
-                    text_dict[master_id] = shape.text.strip()
+        for master_idx, master in enumerate(prs.slide_masters):
+            master_info = {
+                "master_number": master_idx + 1,
+                "content": []
+            }
+            
+            for shape_idx, shape in enumerate(master.shapes):
+                base_id = f"master_{master_idx+1}_shape_{shape_idx}"
+                
+                if hasattr(shape, "text_frame") and shape.text_frame and shape.text.strip():
+                    text_dict[base_id] = shape.text.strip()
+                    master_info["content"].append(shape.text.strip())
+                    extraction_stats["text_elements_found"] += 1
     except:
         pass
-        
-    print(f"Enhanced extraction found {len(text_dict)} text elements")
+    
+    print(f"Enhanced extraction found {len(text_dict)} text elements across {extraction_stats['total_slides']} slides")
+    print(f"Processed {extraction_stats['shapes_processed']} shapes with {extraction_stats['paragraphs_found']} paragraphs")
+    
     return text_dict, slide_metadata
 
 def update_slides(pptx_file, output_file, translated_texts):
-    """Update PowerPoint presentation with translated text, handling various content types"""
+    """Update PowerPoint presentation with translated text while fully preserving formatting"""
     prs = Presentation(pptx_file)
     updated_count = 0
     total_slides = len(prs.slides)
     
-    # Function to update shape text recursively for grouped shapes
-    def update_shape_text(shape, shape_type="shape", parent_id=""):
-        shape_updated = False
+    # Process a text frame while preserving all formatting
+    def update_text_frame(text_frame, new_text):
+        nonlocal updated_count
+        if not text_frame or not new_text:
+            return False
         
-        # Update basic shape text while preserving formatting
-        if hasattr(shape, "text") and shape.text.strip():
-            if parent_id in translated_texts:
-                # If it has a text_frame, use that to preserve formatting
-                if hasattr(shape, "text_frame"):
-                    try:
-                        # Save original text properties before replacement
-                        para_properties = []
-                        for para in shape.text_frame.paragraphs:
-                            para_props = {
-                                'font_size': None,
-                                'font_bold': None,
-                                'font_italic': None,
-                                'font_underline': None,
-                                'font_name': None,
-                                'alignment': None,
-                                'runs': []
-                            }
-                            
-                            # Save paragraph level properties
-                            if hasattr(para, "alignment") and para.alignment:
-                                para_props['alignment'] = para.alignment
-                                
-                            # Save run level properties (character formatting)
-                            for run in para.runs:
-                                run_props = {}
-                                if hasattr(run, "font") and run.font:
-                                    if hasattr(run.font, "size") and run.font.size:
-                                        run_props['size'] = run.font.size
-                                    if hasattr(run.font, "bold") and run.font.bold is not None:
-                                        run_props['bold'] = run.font.bold
-                                    if hasattr(run.font, "italic") and run.font.italic is not None:
-                                        run_props['italic'] = run.font.italic
-                                    if hasattr(run.font, "underline") and run.font.underline is not None:
-                                        run_props['underline'] = run.font.underline
-                                    if hasattr(run.font, "name") and run.font.name:
-                                        run_props['name'] = run.font.name
-                                    if hasattr(run.font, "color") and run.font.color and hasattr(run.font.color, "rgb"):
-                                        run_props['color'] = run.font.color.rgb
-                                    
-                                para_props['runs'].append(run_props)
-                            
-                            para_properties.append(para_props)
+        # Save formatting details from each paragraph
+        formatting = []
+        for para in text_frame.paragraphs:
+            para_format = {
+                "alignment": para.alignment if hasattr(para, "alignment") else None,
+                "level": para.level if hasattr(para, "level") else None,
+                "runs": []
+            }
+            
+            # Save formatting for each run (text chunk with same formatting)
+            for run in para.runs:
+                run_format = {}
+                if hasattr(run, "font") and run.font:
+                    font = run.font
+                    run_format["size"] = font.size if hasattr(font, "size") else None
+                    run_format["bold"] = font.bold if hasattr(font, "bold") else None
+                    run_format["italic"] = font.italic if hasattr(font, "italic") else None
+                    run_format["underline"] = font.underline if hasattr(font, "underline") else None
+                    
+                    # Store font name and color as well
+                    if hasattr(font, "name"):
+                        run_format["name"] = font.name
+                    if hasattr(font, "color") and hasattr(font.color, "rgb"):
+                        run_format["color"] = font.color.rgb
                         
-                        # Clear the text frame and add the translated text
-                        shape.text = ""
-                        shape.text = translated_texts[parent_id]
-                        
-                        # Try to restore formatting if possible
-                        if len(shape.text_frame.paragraphs) == len(para_properties):
-                            for i, para in enumerate(shape.text_frame.paragraphs):
-                                # Restore paragraph alignment
-                                if para_properties[i]['alignment'] is not None:
-                                    para.alignment = para_properties[i]['alignment']
-                                
-                                # Restore run level formatting if number of runs match
-                                if len(para.runs) == len(para_properties[i]['runs']):
-                                    for j, run in enumerate(para.runs):
-                                        if hasattr(run, "font") and run.font:
-                                            props = para_properties[i]['runs'][j]
-                                            if 'size' in props and props['size']:
-                                                run.font.size = props['size']
-                                            if 'bold' in props and props['bold'] is not None:
-                                                run.font.bold = props['bold']
-                                            if 'italic' in props and props['italic'] is not None:
-                                                run.font.italic = props['italic']
-                                            if 'underline' in props and props['underline'] is not None:
-                                                run.font.underline = props['underline']
-                                            if 'name' in props and props['name']:
-                                                run.font.name = props['name']
-                                            if 'color' in props and props['color']:
-                                                run.font.color.rgb = props['color']
-                        shape_updated = True
-                    except Exception as e:
-                        # If detailed formatting preservation fails, fallback to simple replacement
-                        shape.text = translated_texts[parent_id]
-                        shape_updated = True
-                else:
-                    # Simple replacement if no text_frame
-                    shape.text = translated_texts[parent_id]
-                    shape_updated = True
+                # Save hyperlink if present
+                if hasattr(run, "hyperlink") and run.hyperlink:
+                    run_format["hyperlink"] = run.hyperlink.address
+                    
+                para_format["runs"].append(run_format)
+            
+            formatting.append(para_format)
         
-        # Handle alt text
-        alt_text_id = f"{parent_id}_alt_text"
-        if alt_text_id in translated_texts and hasattr(shape, "shape_properties") and hasattr(shape.shape_properties, "title"):
+        # Clear and set the new text
+        text_frame.clear()
+        p = text_frame.paragraphs[0]
+        p.text = new_text
+        
+        # Try to restore paragraph-level formatting for the first paragraph
+        if formatting and formatting[0]:
+            if formatting[0]["alignment"] is not None:
+                p.alignment = formatting[0]["alignment"]
+            if formatting[0]["level"] is not None:
+                p.level = formatting[0]["level"]
+        
+        # Attempt to restore font formatting for the first run
+        if formatting and formatting[0] and formatting[0]["runs"] and p.runs:
+            run = p.runs[0]
+            original_format = formatting[0]["runs"][0]
+            
+            if hasattr(run, "font"):
+                if original_format.get("size") is not None:
+                    run.font.size = original_format["size"]
+                if original_format.get("bold") is not None:
+                    run.font.bold = original_format["bold"]
+                if original_format.get("italic") is not None:
+                    run.font.italic = original_format["italic"]
+                if original_format.get("underline") is not None:
+                    run.font.underline = original_format["underline"]
+                if original_format.get("name") is not None:
+                    run.font.name = original_format["name"]
+                if original_format.get("color") is not None:
+                    run.font.color.rgb = original_format["color"]
+                    
+                # Restore hyperlink if it was present
+                if original_format.get("hyperlink") is not None and hasattr(run, "hyperlink"):
+                    run.hyperlink.address = original_format["hyperlink"]
+        
+        updated_count += 1
+        return True
+    
+    # Process a single shape and its text
+    def process_shape(shape, shape_id, slide_idx):
+        base_id = f"slide_{slide_idx+1}_shape_{shape_id}"
+        updated = False
+        
+        # Update main text frame if present
+        if base_id in translated_texts and hasattr(shape, "text_frame"):
+            update_text_frame(shape.text_frame, translated_texts[base_id])
+            updated = True
+        
+        # Update placeholder text if present
+        ph_id = f"{base_id}_placeholder"
+        if ph_id in translated_texts and hasattr(shape, "text_frame"):
+            update_text_frame(shape.text_frame, translated_texts[ph_id])
+            updated = True
+        
+        # Update alt text if present
+        alt_id = f"{base_id}_alt"
+        if alt_id in translated_texts and hasattr(shape, "shape_properties") and hasattr(shape.shape_properties, "title"):
             try:
-                shape.shape_properties.title = translated_texts[alt_text_id]
-                shape_updated = True
+                shape.shape_properties.title = translated_texts[alt_id]
+                updated = True
             except:
                 pass
         
-        # Handle SmartArt and other grouped shapes
+        # Update child shapes
         try:
-            if hasattr(shape, "element") and hasattr(shape, "shapes"):
-                # Update text from any child shapes in a group or SmartArt
-                try:
-                    for i, child in enumerate(shape.shapes):
-                        child_id = f"{parent_id}_child_{i}"
-                        child_updated = update_shape_text(child, "group_child", child_id)
-                        shape_updated = shape_updated or child_updated
-                except (AttributeError, TypeError, ValueError):
-                    pass
+            if hasattr(shape, "shapes"):
+                for child_idx, child in enumerate(shape.shapes):
+                    child_id = f"{base_id}_child_{child_idx}"
+                    if child_id in translated_texts and hasattr(child, "text_frame"):
+                        update_text_frame(child.text_frame, translated_texts[child_id])
+                        updated = True
         except:
             pass
         
-        # Update OLE objects alt text if needed
+        # Handle tables
         try:
-            ole_id = f"{parent_id}_ole"
-            if ole_id in translated_texts and hasattr(shape, "alternative_text"):
-                shape.alternative_text = translated_texts[ole_id]
-                shape_updated = True
+            if hasattr(shape, "has_table") and shape.has_table:
+                for row_idx, row in enumerate(shape.table.rows):
+                    for col_idx, cell in enumerate(row.cells):
+                        cell_id = f"slide_{slide_idx+1}_table_{shape_id}_r{row_idx}_c{col_idx}"
+                        if cell_id in translated_texts and hasattr(cell, "text_frame"):
+                            update_text_frame(cell.text_frame, translated_texts[cell_id])
+                            updated = True
         except:
             pass
-            
-        # Update chart text if possible
+        
+        # Handle charts
         try:
-            chart_id = f"{parent_id}_chart"
-            if chart_id in translated_texts and hasattr(shape, "chart") and shape.chart:
-                try:
-                    # We might not be able to update all chart elements, but we can try the title
-                    if hasattr(shape.chart, "chart_title") and shape.chart.chart_title and shape.chart.chart_title.text_frame:
-                        # For chart titles, take just the first part of the translated text
-                        chart_title = translated_texts[chart_id].split(' | ')[0] if ' | ' in translated_texts[chart_id] else translated_texts[chart_id]
-                        shape.chart.chart_title.text_frame.text = chart_title
-                        shape_updated = True
-                except:
-                    pass
+            if hasattr(shape, "chart") and shape.chart:
+                # Update chart title
+                chart_title_id = f"{base_id}_chart_title"
+                if chart_title_id in translated_texts and hasattr(shape.chart, "chart_title") and hasattr(shape.chart.chart_title, "text_frame"):
+                    update_text_frame(shape.chart.chart_title.text_frame, translated_texts[chart_title_id])
+                    updated = True
         except:
             pass
+        
+        # Try to handle special text objects
+        special_id = f"{base_id}_special"
+        if special_id in translated_texts:
+            try:
+                if hasattr(shape, "text") and not hasattr(shape, "text_frame"):
+                    shape.text = translated_texts[special_id]
+                    updated = True
+            except:
+                pass
                 
-        return shape_updated
+        return updated
     
-    # Try to update master slide text if it was extracted and translated
+    # Update master slides
     try:
-        for idx, master in enumerate(prs.slide_masters):
-            for shape_id, shape in enumerate(master.shapes):
-                master_id = f"master_{idx+1}_shape_{shape_id}"
-                if master_id in translated_texts and hasattr(shape, "text") and shape.text.strip():
-                    try:
-                        shape.text = translated_texts[master_id]
-                        updated_count += 1
-                    except:
-                        pass
+        for master_idx, master in enumerate(prs.slide_masters):
+            for shape_idx, shape in enumerate(master.shapes):
+                base_id = f"master_{master_idx+1}_shape_{shape_idx}"
+                if base_id in translated_texts and hasattr(shape, "text_frame"):
+                    update_text_frame(shape.text_frame, translated_texts[base_id])
     except:
         pass
     
     # Update each slide with progress bar
     from tqdm import tqdm
     with tqdm(total=total_slides, desc="Updating slides", unit="slide") as pbar:
-        for index, slide in enumerate(prs.slides):
+        for slide_idx, slide in enumerate(prs.slides):
             # Update slide notes if any
-            if hasattr(slide, "notes_slide") and slide.notes_slide:
-                try:
-                    note_id = f"slide_{index+1}_notes"
-                    if note_id in translated_texts:
-                        for note_shape in slide.notes_slide.shapes:
-                            if hasattr(note_shape, "text") and note_shape.text.strip():
-                                note_shape.text = translated_texts[note_id]
-                                updated_count += 1
-            except:
-                pass
-                
-            # Process all shapes on the slide
-            for shape_id, shape in enumerate(slide.shapes):
-                base_id = f"slide_{index+1}_shape_{shape_id}"
-                
-                # Update this shape (and any grouped sub-shapes)
-                if update_shape_text(shape, "shape", base_id):
-                    updated_count += 1
-                
-                # Handle tables separately
-                if hasattr(shape, "has_table") and shape.has_table:
-                    for row_idx, row in enumerate(shape.table.rows):
-                        for col_idx, cell in enumerate(row.cells):
-                            if cell.text.strip():
-                                # Reconstruct cell ID to match the extraction phase
-                                cell_id = f"slide_{index+1}_table_{shape_id}_r{row_idx}_c{col_idx}"
-                                if cell_id in translated_texts:
-                                    try:
-                                        # Save original text properties before replacement
-                                        para_properties = []
-                                        for para in cell.text_frame.paragraphs:
-                                        para_props = {
-                                            'alignment': None,
-                                            'runs': []
-                                        }
-                                        
-                                        # Save paragraph level properties
-                                        if hasattr(para, "alignment") and para.alignment:
-                                            para_props['alignment'] = para.alignment
-                                            
-                                        # Save run level properties (character formatting)
-                                        for run in para.runs:
-                                            run_props = {}
-                                            if hasattr(run, "font") and run.font:
-                                                if hasattr(run.font, "size") and run.font.size:
-                                                    run_props['size'] = run.font.size
-                                                if hasattr(run.font, "bold") and run.font.bold is not None:
-                                                    run_props['bold'] = run.font.bold
-                                                if hasattr(run.font, "italic") and run.font.italic is not None:
-                                                    run_props['italic'] = run.font.italic
-                                                if hasattr(run.font, "underline") and run.font.underline is not None:
-                                                    run_props['underline'] = run.font.underline
-                                                if hasattr(run.font, "name") and run.font.name:
-                                                    run_props['name'] = run.font.name
-                                                if hasattr(run.font, "color") and run.font.color and hasattr(run.font.color, "rgb"):
-                                                    run_props['color'] = run.font.color.rgb
-                                            
-                                            # Store hyperlink information if present
-                                            if hasattr(run, "hyperlink") and run.hyperlink:
-                                                run_props['hyperlink'] = run.hyperlink.address
-                                                
-                                            para_props['runs'].append(run_props)
-                                        
-                                        para_properties.append(para_props)
-                                    
-                                    # Clear the text and add the translated text
-                                    cell.text = ""
-                                    cell.text = translated_texts[cell_id]
-                                    
-                                    # Try to restore formatting if possible
-                                    if len(cell.text_frame.paragraphs) == len(para_properties):
-                                        for i, para in enumerate(cell.text_frame.paragraphs):
-                                            # Restore paragraph alignment
-                                            if para_properties[i]['alignment'] is not None:
-                                                para.alignment = para_properties[i]['alignment']
-                                            
-                                            # Restore run level formatting if number of runs match
-                                            if len(para.runs) == len(para_properties[i]['runs']):
-                                                for j, run in enumerate(para.runs):
-                                                    if hasattr(run, "font") and run.font:
-                                                        props = para_properties[i]['runs'][j]
-                                                        if 'size' in props and props['size']:
-                                                            run.font.size = props['size']
-                                                        if 'bold' in props and props['bold'] is not None:
-                                                            run.font.bold = props['bold']
-                                                        if 'italic' in props and props['italic'] is not None:
-                                                            run.font.italic = props['italic']
-                                                        if 'underline' in props and props['underline'] is not None:
-                                                            run.font.underline = props['underline']
-                                                        if 'name' in props and props['name']:
-                                                            run.font.name = props['name']
-                                                        if 'color' in props and props['color']:
-                                                            run.font.color.rgb = props['color']
-                                                            
-                                                        # Restore hyperlink if present
-                                                        if 'hyperlink' in props and props['hyperlink'] and hasattr(run, "hyperlink"):
-                                                            run.hyperlink.address = props['hyperlink']
-                                except Exception as e:
-                                    # Fall back to simple replacement if formatting preservation fails
-                                    cell.text = translated_texts[cell_id]
-                                
-                                updated_count += 1
-        
-            # Try to update header and footer text if available
             try:
-                # Check placeholder shapes for header/footer content
-                for shape in slide.shapes:
-                    if hasattr(shape, "is_placeholder") and shape.is_placeholder and hasattr(shape, "placeholder_format"):
-                        try:
-                            ph_type = shape.placeholder_format.type
-                            if ph_type in [2, 3, 4]:  # header, footer, date placeholders
-                                ph_id = f"slide_{index+1}_placeholder_{ph_type}"
-                                if ph_id in translated_texts and hasattr(shape, "text") and shape.text.strip():
-                                    shape.text = translated_texts[ph_id]
-                                    updated_count += 1
-                    except:
-                        pass
+                if hasattr(slide, "notes_slide") and slide.notes_slide:
+                    for note_shape in slide.notes_slide.shapes:
+                        note_id = f"slide_{slide_idx+1}_notes"
+                        if note_id in translated_texts and hasattr(note_shape, "text_frame"):
+                            update_text_frame(note_shape.text_frame, translated_texts[note_id])
             except:
                 pass
+            
+            # Update each shape on the slide
+            for shape_idx, shape in enumerate(slide.shapes):
+                process_shape(shape, shape_idx, slide_idx)
                 
-            # Update progress bar after each slide
-            completion_percentage = int(100 * (index + 1) / total_slides)
+            # Update progress bar
+            completion_percentage = int(100 * (slide_idx + 1) / total_slides)
             pbar.set_description(f"Updating slides: {completion_percentage}% complete")
             pbar.update(1)
             pbar.refresh()
+        
+            # Update header/footer elements
+            try:
+                for elem in ["header", "footer", "date"]:
+                    elem_id = f"slide_{slide_idx+1}_{elem}"
+                    if elem_id in translated_texts:
+                        placeholder_index = {"header": 2, "footer": 4, "date": 3}.get(elem)
+                        if placeholder_index:
+                            for shape in slide.shapes:
+                                try:
+                                    if (hasattr(shape, "is_placeholder") and 
+                                        shape.is_placeholder and 
+                                        hasattr(shape, "placeholder_format") and 
+                                        shape.placeholder_format.idx == placeholder_index and
+                                        hasattr(shape, "text_frame")):
+                                        update_text_frame(shape.text_frame, translated_texts[elem_id])
+                                except:
+                                    pass
+            except:
+                pass
     
     print(f"Updated {updated_count} text elements in the presentation")
+    
     # Save the updated presentation to a new file
     prs.save(output_file)
     return output_file
@@ -636,7 +586,7 @@ def extract_json_blocks(text):
     try:
         # Clean the text: remove any leading/trailing non-JSON content
         text = re.sub(r'^[^{]*', '', text)  # Remove anything before the first {
-        text = re.sub(r'[^}]*$', '', text)  # Remove anything after the last }
+        text = re.sub(r'[^}]*$', '', text)  # Remove anything after the last }$', '', text)  # Remove anything after the last }
         
         # Try extracting json blocks with a more robust pattern
         # This pattern tries to match balanced { } pairs
@@ -744,7 +694,7 @@ def setup_recovery_system(file_id, text_dict, slide_metadata, source_language, t
     
     return recovery_state, recovery_file, save_recovery_state
 
-def translate_batch(batch, batch_index, slide_metadata, source_language, target_language, api_key=None, max_retries=2, cost_tracker=None):
+def translate_batch(batch, batch_index, slide_metadata, source_language, target_language, api_key=None, max_retries=3, cost_tracker=None):
     """
     Translate a single batch with retry logic.
     """
@@ -836,7 +786,7 @@ Reply ONLY with the translated JSON. The JSON MUST be valid and parseable.
                     "user_id": "anonymous_user"
                 }
             )
-            
+
             # Track token usage and cost
             prompt_tokens = response.usage.input_tokens
             completion_tokens = response.usage.output_tokens
@@ -858,7 +808,7 @@ Reply ONLY with the translated JSON. The JSON MUST be valid and parseable.
             # Show running total cost
             if cost_tracker is not None:
                 print(f"Running total: ${cost_tracker['total_cost']:.4f} for {cost_tracker['api_calls']} API calls")
-
+            
             translated_text = response.content[0].text
             
             if "```json" in translated_text:
@@ -972,7 +922,7 @@ def translate_text(text_dict, slide_metadata, source_language, target_language, 
         full_translated_dict = recovery_state["translated_items"].copy()
     else:
         # For Japanese or other multibyte languages, use smaller batches
-        max_tokens = 80000 if target_language in ["ja", "zh", "ko"] else 150000
+        max_tokens = 60000 if target_language in ["ja", "zh", "ko"] else 120000
         prompt_tokens = 2000
         
         print(f"Using smaller batch size for {target_language} translation" if target_language in ["ja", "zh", "ko"] else "Using standard batch size")
@@ -994,7 +944,7 @@ def translate_text(text_dict, slide_metadata, source_language, target_language, 
                 try:
                     batch_result = translate_batch(
                         batch, batch_index+1, slide_metadata, 
-                        source_language, target_language, api_key=api_key,
+                        source_language, target_language, api_key=api_key, 
                         cost_tracker=cost_tracker
                     )
                     
@@ -1030,8 +980,8 @@ def translate_text(text_dict, slide_metadata, source_language, target_language, 
                 
                 retry_batch = {k: text_dict[k] for k in keys if k in text_dict}
                 # Use smaller chunks for CJK languages
-                divisor = 8 if target_language in ["ja", "zh", "ko"] else 4
-                chunk_size = max(5, len(retry_batch) // divisor)
+                divisor = 10 if target_language in ["ja", "zh", "ko"] else 5
+                chunk_size = max(3, len(retry_batch) // divisor)
                 retry_items = list(retry_batch.items())
                 sub_batches = [dict(retry_items[i:i+chunk_size]) 
                                for i in range(0, len(retry_items), chunk_size)]
@@ -1117,25 +1067,41 @@ Reply ONLY with the translated JSON.
                 # Track token usage and cost for final batch
                 prompt_tokens = response.usage.input_tokens
                 completion_tokens = response.usage.output_tokens
+                # Use the estimate_cost function
+                def estimate_cost(prompt_tokens, completion_tokens, model="claude-3-7-sonnet"):
+                    # Claude 3.5 Sonnet pricing: $3 per 1M input tokens, $15 per 1M output tokens
+                    # Claude 3 Sonnet pricing: $3 per 1M input tokens, $15 per 1M output tokens
+                    rates = {
+                        "claude-3-7-sonnet": {"input": 3.0 / 1000000, "output": 15.0 / 1000000},
+                        "claude-3-sonnet": {"input": 3.0 / 1000000, "output": 15.0 / 1000000}, 
+                        "claude-3-opus": {"input": 15.0 / 1000000, "output": 75.0 / 1000000},
+                        "claude-3-haiku": {"input": 0.25 / 1000000, "output": 1.25 / 1000000}
+                    }
+                    
+                    model_rates = rates.get(model, rates["claude-3-7-sonnet"])  # Default to sonnet if not found
+                    input_cost = prompt_tokens * model_rates["input"]
+                    output_cost = completion_tokens * model_rates["output"]
+                    total_cost = input_cost + output_cost
+                    
+                    return {
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": completion_tokens,
+                        "input_cost": input_cost,
+                        "output_cost": output_cost,
+                        "total_cost": total_cost
+                    }
                 
-                # Calculate cost
-                final_cost = {
-                    "input_cost": prompt_tokens * (3.0 / 1000000),
-                    "output_cost": completion_tokens * (15.0 / 1000000),
-                    "total_cost": (prompt_tokens * (3.0 / 1000000)) + (completion_tokens * (15.0 / 1000000))
-                }
+                batch_cost = estimate_cost(prompt_tokens, completion_tokens, "claude-3-7-sonnet")
                 
-                # Update cost tracker
                 cost_tracker["total_input_tokens"] += prompt_tokens
                 cost_tracker["total_output_tokens"] += completion_tokens
-                cost_tracker["total_input_cost"] += final_cost["input_cost"]
-                cost_tracker["total_output_cost"] += final_cost["output_cost"]
-                cost_tracker["total_cost"] += final_cost["total_cost"]
+                cost_tracker["total_input_cost"] += batch_cost["input_cost"]
+                cost_tracker["total_output_cost"] += batch_cost["output_cost"]
+                cost_tracker["total_cost"] += batch_cost["total_cost"]
                 cost_tracker["api_calls"] += 1
                 
                 print(f"Final batch token usage: {prompt_tokens} input + {completion_tokens} output tokens")
-                print(f"Final batch cost: ${final_cost['total_cost']:.4f}")
-                print(f"Running total: ${cost_tracker['total_cost']:.4f} for {cost_tracker['api_calls']} API calls")
+                print(f"Final batch cost: ${batch_cost['total_cost']:.4f} (${batch_cost['input_cost']:.4f} input + ${batch_cost['output_cost']:.4f} output)")
                 
                 translated_text = response.content[0].text
                 
@@ -1182,7 +1148,7 @@ Reply ONLY with the translated JSON.
     else:
         print("All items successfully translated!")
     
-    # Print final cost summary
+    # Print cost summary
     print("\n=== API Cost Summary ===")
     print(f"Total API calls: {cost_tracker['api_calls']}")
     print(f"Total input tokens: {cost_tracker['total_input_tokens']:,}")
@@ -1193,24 +1159,7 @@ Reply ONLY with the translated JSON.
     print(f"Total cost: ${cost_tracker['total_cost']:.4f}")
     
     return full_translated_dict
-
-def translate_pptx(input_file, output_file, source_language="en", target_language="fr", resume_file=None, api_key=None):
-    """Main function to translate PowerPoint files"""
-    print(f"Extracting text from {input_file}...")
-    text_dict, slide_metadata = extract_text(input_file)
-    print(f"Found {len(text_dict)} text elements across {len(slide_metadata)} slides")
     
-    print(f"Translating from {source_language} to {target_language}...")
-    translated_texts = translate_text(text_dict, slide_metadata, source_language, target_language, resume_file, api_key=api_key)
-    
-    print(f"Updating PowerPoint with translated text...")
-    update_slides(input_file, output_file, translated_texts)
-    
-    print(f"Translation completed!")
-    print(f"Translated presentation saved as: {output_file}")
-    
-    return output_file
-
 def list_recovery_files():
     """List all available recovery files and their status"""
     recovery_dir = "translation_recovery"
@@ -1244,8 +1193,25 @@ def list_recovery_files():
         except Exception as e:
             print(f"  {f} - Error reading file: {e}")
 
+def translate_pptx(input_file, output_file, source_language="en", target_language="fr", resume_file=None, api_key=None):
+    """Main function to translate PowerPoint files with comprehensive text extraction"""
+    print(f"Extracting text from {input_file} with enhanced extraction...")
+    text_dict, slide_metadata = extract_text(input_file)
+    print(f"Found {len(text_dict)} text elements across {len(slide_metadata)} slides")
+    
+    print(f"Translating from {source_language} to {target_language}...")
+    translated_texts = translate_text(text_dict, slide_metadata, source_language, target_language, resume_file, api_key=api_key)
+    
+    print(f"Updating PowerPoint with translated text while preserving formatting...")
+    update_slides(input_file, output_file, translated_texts)
+    
+    print(f"Translation completed!")
+    print(f"Translated presentation saved as: {output_file}")
+    
+    return output_file
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PowerPoint PPTX Translator")
+    parser = argparse.ArgumentParser(description="Enhanced PowerPoint PPTX Translator")
     parser.add_argument("--resume", help="Resume translation from a recovery file")
     parser.add_argument("--list-recovery", action="store_true", help="List available recovery files")
     parser.add_argument("--input-file", help="Input PowerPoint file (.pptx)")
@@ -1289,4 +1255,5 @@ if __name__ == "__main__":
     else:
         target_language = input("Enter target language (e.g., fr for French): ")
     
+    # Run the translation with all the provided parameters
     translate_pptx(input_file, output_file, source_language, target_language, args.resume, api_key=args.api_key)
